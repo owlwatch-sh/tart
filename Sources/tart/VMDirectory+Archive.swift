@@ -64,6 +64,17 @@ extension VMDirectory {
   }
 
   func importFromArchive(path: String) throws {
+    try extractArchive(path: path)
+
+    if isStackedVM {
+      try restoreStackedArchive()
+    }
+  }
+
+  // extractArchive is on its own so that its streams are closed when it
+  // returns: the extract stream may not have written every file until it is
+  // closed, and restoring a stacked archive reads what it wrote.
+  private func extractArchive(path: String) throws {
     guard let fileStream = ArchiveByteStream.fileStream(path: FilePath(path), mode: .readOnly, options: [],
                                                         permissions: permissions) else {
       let details = Errno(rawValue: CInt(errno))
@@ -103,10 +114,6 @@ extension VMDirectory {
     }
 
     _ = try ArchiveStream.process(readingFrom: decodeStream, writingTo: extractStream)
-
-    if isStackedVM {
-      try restoreStackedArchive()
-    }
   }
 
   /// Builds a self-contained staging directory for a stacked archive, if this
