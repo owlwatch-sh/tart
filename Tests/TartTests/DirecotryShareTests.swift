@@ -1,3 +1,4 @@
+import ArgumentParser
 import XCTest
 @testable import tart
 
@@ -52,6 +53,17 @@ final class DirectoryShareTests: XCTestCase {
     XCTAssertEqual(inverseRoShare.mountTag, "foo-bar")
   }
 
+  func testMissingPathIsRejected() throws {
+    for parseFrom in ["", ":", "ro", ":ro", "tag=foo-bar"] {
+      XCTAssertThrowsError(try DirectoryShare(parseFrom: parseFrom), "--dir=\"\(parseFrom)\"") { error in
+        XCTAssertEqual(
+          (error as? ValidationError)?.message,
+          "--dir requires a path, e.g. --dir=build:/Users/admin/build"
+        )
+      }
+    }
+  }
+
   func testURL() throws {
     let archiveWithoutNameOrOptions = try DirectoryShare(parseFrom: "https://example.com/archive.tar.gz")
     XCTAssertNil(archiveWithoutNameOrOptions.name)
@@ -70,5 +82,9 @@ final class DirectoryShareTests: XCTestCase {
     XCTAssertEqual(archiveWithNameAndOptions.path, URL(string: "https://example.com/archive.tar.gz")!)
     XCTAssertTrue(archiveWithNameAndOptions.readOnly)
     XCTAssertEqual(archiveWithNameAndOptions.mountTag, "sometag")
+
+    let httpArchiveWithName = try DirectoryShare(parseFrom: "somename:http://example.com/archive.tar.gz")
+    XCTAssertEqual(httpArchiveWithName.name, "somename")
+    XCTAssertEqual(httpArchiveWithName.path, URL(string: "http://example.com/archive.tar.gz")!)
   }
 }

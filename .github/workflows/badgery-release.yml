@@ -1,6 +1,6 @@
-name: Badgery Release
+name: Owlwatch Release
 
-# Badgery's builds of this fork: arm64 only, signed with Badgery's Developer ID
+# Owlwatch's builds of this fork: arm64 only, signed with Owlwatch's Developer ID
 # and without com.apple.vm.networking, which needs Cirrus Labs' provisioning
 # profile (so --net-bridged is unavailable)
 #
@@ -13,14 +13,14 @@ on:
     branches:
       - badgery
     tags:
-      - "*-badgery.*"
+      - "*-owlwatch.*"
 
 permissions:
   contents: read
 
 jobs:
   release:
-    if: github.repository == 'owlery-sh/tart'
+    if: github.repository == 'owlwatch-sh/tart'
     name: Release
     runs-on: macos-26
     timeout-minutes: 90
@@ -81,7 +81,7 @@ jobs:
         run: |
           # Report upstream's version: the guest agent in macOS guests reads it from a
           # console port name and exits when it doesn't accept it, as with 2.40.1-badgery.2
-          VERSION="${VERSION%%-badgery.*}" .ci/set-version.sh
+          VERSION="${VERSION%%-owlwatch.*}" .ci/set-version.sh
           sh .ci/build-release.sh arm64
       - name: Assemble, sign and notarize
         if: env.RELEASE == 'true'
@@ -132,7 +132,7 @@ jobs:
           gh release create "$VERSION" tart.tar.gz SHA256SUMS \
             --repo "$GITHUB_REPOSITORY" \
             --title "$VERSION" \
-            --notes "Badgery build of Tart $VERSION: arm64, signed by Badgery, adds \`tart run --vsock-socket\`. Without com.apple.vm.networking, so --net-bridged is unavailable."
+            --notes "Owlwatch build of Tart $VERSION: arm64, signed by Owlwatch (Bright Shore Technologies), adds \`tart run --vsock-socket\` and \`--net-softnet-control-socket\`. Without com.apple.vm.networking, so --net-bridged is unavailable."
       - name: Remove signing material
         if: always() && env.RELEASE == 'true'
         run: |

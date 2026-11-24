@@ -1,5 +1,6 @@
 import Foundation
 import ArgumentParser
+import Virtualization
 import XCTest
 @testable import tart
 
@@ -51,6 +52,66 @@ final class CommandBehaviorTests: XCTestCase {
 
         let quiet = try await commandOutput(List.self, sourceArguments + ["--quiet"])
         XCTAssertEqual(quiet.split(separator: "\n").map(String.init), rows.compactMap { $0["Name"] as? String })
+      }
+    }
+  }
+
+  func testListSkipsLocalVMsDeletedDuringMetadataLookup() async throws {
+    try await assertListSurvivesDeletion(sourceArguments: ["--source", "local"])
+  }
+
+  func testListSkipsOCIVMsDeletedDuringMetadataLookup() async throws {
+    try await assertListSurvivesDeletion(sourceArguments: ["--source", "oci"])
+  }
+
+  func testListSkipsVMsDeletedDuringMetadataLookupAcrossSources() async throws {
+    try await assertListSurvivesDeletion(sourceArguments: [])
+  }
+
+  func testListPreservesMetadataPermissionErrors() async throws {
+    for source in ["local", "oci"] {
+      try await withTemporaryTartHome {
+        let vmDir = try source == "local" ? VMStorageLocal().create("inaccessible") :
+          VMStorageOCI().create(RemoteName("example.com/org/inaccessible:latest"))
+        var vmConfig = config()
+        vmConfig.diskFormat = .asif
+        try vmConfig.save(toURL: vmDir.configURL)
+        XCTAssertTrue(FileManager.default.createFile(atPath: vmDir.nvramURL.path, contents: Data()))
+        XCTAssertTrue(FileManager.default.createFile(atPath: vmDir.diskURL.path, contents: Data()))
+        defer {
+          try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: vmDir.baseURL.path)
+        }
+
+        let previousPath = try installUnavailableDiskutil(beforeFailure: "/bin/chmod 000 \"${4%/*}\"")
+        defer { restoreEnvironment("PATH", to: previousPath) }
+        do {
+          _ = try await commandOutput(List.self, ["--source", source, "--format", "json"])
+          XCTFail("list should report metadata permission errors")
+        } catch {
+          XCTAssertEqual((error as NSError).domain, NSCocoaErrorDomain)
+          XCTAssertEqual((error as NSError).code, NSFileReadNoPermissionError)
+        }
+      }
+    }
+  }
+
+  func testASIFResizeFailureIsReportedOnce() throws {
+    try withTemporaryTartHome {
+      let previousPath = try installUnavailableDiskutil(beforeFailure: """
+      if [ "$2" = info ]; then
+        echo '<plist version="1.0"><dict><key>Size</key><integer>1000000000</integer></dict></plist>'
+        exit 0
+      fi
+      """)
+      defer { restoreEnvironment("PATH", to: previousPath) }
+
+      let vmDir = try makeStandaloneVM(named: "asif", diskContents: "disk")
+      var vmConfig = try VMConfig(fromURL: vmDir.configURL)
+      vmConfig.diskFormat = .asif
+      try vmConfig.save(toURL: vmDir.configURL)
+
+      XCTAssertThrowsError(try vmDir.resizeDisk(2)) { error in
+        XCTAssertEqual("\(error)", "Failed to resize ASIF disk image: Resource temporarily unavailable\n")
       }
     }
   }
@@ -155,6 +216,17 @@ final class CommandBehaviorTests: XCTestCase {
     }
   }
 
+  func testPushRejectsInvalidConcurrencyAndChunkSize() {
+    XCTAssertThrowsError(try Push.parse(["vm", "example.com/org/vm:latest", "--concurrency", "0"]))
+    XCTAssertThrowsError(try Push.parse(["vm", "example.com/org/vm:latest", "--chunk-size=-1"]))
+    XCTAssertNoThrow(try Push.parse(["vm", "example.com/org/vm:latest", "--chunk-size", "0"]))
+  }
+
+  func testCreateRejectsRemoteName() {
+    XCTAssertThrowsError(try Create.parse(["org/vm", "--linux"]))
+    XCTAssertNoThrow(try Create.parse(["vm", "--linux"]))
+  }
+
   func testStandaloneDeleteDoesNotInitializeContentStore() throws {
     try withTemporaryTartHome {
       let vmDir = try VMStorageLocal().create("standalone")
@@ -178,6 +250,42 @@ final class CommandBehaviorTests: XCTestCase {
     XCTAssertFalse(RuntimeError.VMIsRunning("running").isFileNotFound())
   }
 
+  func testExportDerivesDefaultPathFromRemoteName() async throws {
+    try await withTemporaryTartHome {
+      let vmDir = try VMStorageOCI().create(try RemoteName("example.com/org/vm:latest"))
+      try config().save(toURL: vmDir.configURL)
+      XCTAssertTrue(FileManager.default.createFile(atPath: vmDir.nvramURL.path, contents: Data()))
+      XCTAssertTrue(FileManager.default.createFile(atPath: vmDir.diskURL.path, contents: Data()))
+
+      let workingDirectory = try temporaryDirectory()
+      let previousDirectory = FileManager.default.currentDirectoryPath
+      FileManager.default.changeCurrentDirectoryPath(workingDirectory.path)
+      defer { FileManager.default.changeCurrentDirectoryPath(previousDirectory) }
+
+      try await Export.parse(["example.com/org/vm:latest"]).run()
+
+      XCTAssertTrue(FileManager.default.fileExists(atPath: workingDirectory.appendingPathComponent("vm:latest.tvm").path))
+    }
+  }
+
+  func testClonePruneLimitFromEnvironment() throws {
+    let key = "TART_CLONE_PRUNE_LIMIT"
+    let previous = ProcessInfo.processInfo.environment[key]
+    defer { restoreEnvironment(key, to: previous) }
+
+    let args = ["source", "destination"]
+    unsetenv(key)
+    XCTAssertEqual(try Clone.parse(args).pruneLimitBytes(), 100 << 30)
+    setenv(key, "20", 1)
+    XCTAssertEqual(try Clone.parse(args).pruneLimitBytes(), 20 << 30)
+
+    for invalid in ["invalid", String(UInt.max)] {
+      setenv(key, invalid, 1)
+      XCTAssertThrowsError(try Clone.parse(args).pruneLimitBytes())
+      XCTAssertEqual(try Clone.parse(args + ["--prune-limit", "0"]).pruneLimitBytes(), 0)
+    }
+  }
+
   func testCloneRejectsExistingDestinationUnlessOverwriteIsRequested() async throws {
     try await withTemporaryTartHome {
       let source = try makeStandaloneVM(named: "source", diskContents: "source")
@@ -199,6 +307,64 @@ final class CommandBehaviorTests: XCTestCase {
       try await overwriteCommand.run()
 
       XCTAssertEqual(try Data(contentsOf: destination.diskURL), Data("source".utf8))
+    }
+  }
+
+  func testImportRejectsExistingDestinationUnlessOverwriteIsRequested() async throws {
+    try await withTemporaryTartHome {
+      let source = try makeStandaloneVM(named: "source", diskContents: "source")
+      let destination = try makeStandaloneVM(named: "destination", diskContents: "existing")
+      let archiveURL = try temporaryDirectory().appendingPathComponent("source.tvm")
+      try source.exportToArchive(path: archiveURL.path)
+
+      let command = try Import.parseAsRoot([archiveURL.path, "destination"]) as! Import
+
+      do {
+        try await command.run()
+        XCTFail("expected importing over an existing VM to be rejected")
+      } catch let error as ValidationError {
+        XCTAssertEqual(error.message, "VM \"destination\" already exists, use --overwrite to replace it")
+      }
+
+      XCTAssertEqual(try Data(contentsOf: destination.diskURL), Data("existing".utf8))
+
+      let overwriteCommand = try Import.parseAsRoot(["--overwrite", archiveURL.path, "destination"]) as! Import
+      try await overwriteCommand.run()
+
+      XCTAssertEqual(try Data(contentsOf: destination.diskURL), Data("source".utf8))
+    }
+  }
+
+  func testRenameRejectsRunningVM() async throws {
+    try await withTemporaryTartHome {
+      let vmDir = try makeStandaloneVM(named: "vm", diskContents: "vm")
+
+      // Hold the VM's PID lock from another process, like "tart run" does
+      let holder = Process()
+      holder.executableURL = URL(fileURLWithPath: "/usr/bin/perl")
+      holder.arguments = [
+        "-MFcntl", "-e",
+        #"open(my $f, "+<", shift) or die; fcntl($f, F_SETLK, pack("qqiss", 0, 0, 0, F_WRLCK, SEEK_SET)) or die; $| = 1; print "locked\n"; sleep"#,
+        vmDir.configURL.path,
+      ]
+      let stdout = Pipe()
+      holder.standardOutput = stdout
+      try holder.run()
+      defer {
+        holder.terminate()
+        holder.waitUntilExit()
+      }
+      _ = stdout.fileHandleForReading.availableData
+
+      do {
+        try await Rename.parse(["vm", "renamed"]).run()
+        XCTFail("expected renaming a running VM to be rejected")
+      } catch let error as RuntimeError {
+        XCTAssertEqual(error.description, "VM \"vm\" is running")
+      }
+
+      XCTAssertTrue(try VMStorageLocal().exists("vm"))
+      XCTAssertFalse(try VMStorageLocal().exists("renamed"))
     }
   }
 
@@ -262,6 +428,38 @@ final class CommandBehaviorTests: XCTestCase {
     }
   }
 
+  func testSetDiskReplacesDiskWhenTartHomeContainsSpaces() async throws {
+    let home = try temporaryDirectory().appendingPathComponent("Tart Home", isDirectory: true)
+    let previousHome = ProcessInfo.processInfo.environment["TART_HOME"]
+    setenv("TART_HOME", home.path, 1)
+    defer { restoreEnvironment("TART_HOME", to: previousHome) }
+
+    let vmDir = try makeStandaloneVM(named: "spaces", diskContents: "disk")
+    let replacementURL = try temporaryDirectory().appendingPathComponent("replacement.img")
+    XCTAssertTrue(FileManager.default.createFile(atPath: replacementURL.path, contents: Data("replacement".utf8)))
+
+    let command = try Set.parseAsRoot(["spaces", "--disk", replacementURL.path]) as! Set
+    try await command.run()
+
+    XCTAssertEqual(try Data(contentsOf: vmDir.diskURL), Data("replacement".utf8))
+  }
+
+  func testSetPreservesDisplayRefitWhenChangingOtherOptions() async throws {
+    try await withTemporaryTartHome {
+      let vmDir = try makeStandaloneVM(named: "display-refit", diskContents: "disk")
+      var vmConfig = try VMConfig(fromURL: vmDir.configURL)
+      vmConfig.displayRefit = false
+      try vmConfig.save(toURL: vmDir.configURL)
+
+      let command = try Set.parseAsRoot(["display-refit", "--cpu", "4"]) as! Set
+      try await command.run()
+
+      let updatedConfig = try VMConfig(fromURL: vmDir.configURL)
+      XCTAssertEqual(updatedConfig.displayRefit, false)
+      XCTAssertEqual(updatedConfig.cpuCount, 4)
+    }
+  }
+
   func testRemoteAdditionalDiskRetainsTemporaryBackingFileLock() throws {
     try withTemporaryTartHome {
       let storage = try VMStorageOCI()
@@ -290,6 +488,36 @@ final class CommandBehaviorTests: XCTestCase {
     }
   }
 
+  func testRemoteAdditionalDiskHonorsDiskOptions() throws {
+    try withTemporaryTartHome {
+      let storage = try VMStorageOCI()
+      let name = try RemoteName("example.com/org/image:latest")
+      let cachedImage = try storage.create(name)
+      try config().save(toURL: cachedImage.configURL)
+      XCTAssertTrue(FileManager.default.createFile(atPath: cachedImage.nvramURL.path, contents: Data()))
+      XCTAssertTrue(FileManager.default.createFile(
+        atPath: cachedImage.diskURL.path,
+        contents: Data(repeating: 0, count: 4096)
+      ))
+
+      let additionalDisk = try AdditionalDisk(parseFrom: "\(name):caching=cached,sync=none")
+      let attachment = try XCTUnwrap(additionalDisk.configuration.attachment as? VZDiskImageStorageDeviceAttachment)
+      XCTAssertEqual(attachment.cachingMode, .cached)
+      XCTAssertEqual(attachment.synchronizationMode, .none)
+    }
+  }
+
+  func testAdditionalDiskWithoutPathIsRejected() throws {
+    for parseFrom in ["", ":", "ro", ":ro"] {
+      XCTAssertThrowsError(try AdditionalDisk(parseFrom: parseFrom), "--disk=\"\(parseFrom)\"") { error in
+        XCTAssertEqual(
+          (error as? ValidationError)?.message,
+          "--disk requires a path or URL, e.g. --disk=/path/to/disk.img"
+        )
+      }
+    }
+  }
+
   func testGarbageCollectionPreservesLockedTemporaryDirectory() throws {
     try withTemporaryTartHome {
       let temporaryVMDir = try VMDirectory.temporary()
@@ -306,6 +534,46 @@ final class CommandBehaviorTests: XCTestCase {
       try lock.unlock()
       try Config().gc()
       XCTAssertFalse(FileManager.default.fileExists(atPath: temporaryVMDir.baseURL.path))
+    }
+  }
+
+  private func assertListSurvivesDeletion(sourceArguments: [String]) async throws {
+    let digest = "sha256:" + String(repeating: "a", count: 64)
+    for outputArguments in [["--format", "json"], [], ["--quiet"]] {
+      try await withTemporaryTartHome {
+        // diskutil runs after enumeration, making the deletion race deterministic.
+        let previousPath = try installUnavailableDiskutil(beforeFailure: "/bin/rm -rf \"${4%/*}\"")
+        defer { restoreEnvironment("PATH", to: previousPath) }
+
+        let local = try VMStorageLocal()
+        let oci = try VMStorageOCI()
+        for (name, diskFormat) in [("disappearing", DiskImageFormat.asif), ("healthy", .raw)] {
+          let remoteName = try RemoteName("example.com/org/\(name)@\(digest)")
+          for vmDir in [try local.create(name), try oci.create(remoteName)] {
+            var vmConfig = config()
+            vmConfig.diskFormat = diskFormat
+            try vmConfig.save(toURL: vmDir.configURL)
+            XCTAssertTrue(FileManager.default.createFile(atPath: vmDir.nvramURL.path, contents: Data()))
+            XCTAssertTrue(FileManager.default.createFile(atPath: vmDir.diskURL.path, contents: Data()))
+          }
+        }
+
+        let arguments = sourceArguments + outputArguments
+        let output = try await commandOutput(List.self, arguments)
+        let expectedNames = sourceArguments.isEmpty ? ["healthy", "example.com/org/healthy@\(digest)"] :
+          [sourceArguments.last == "local" ? "healthy" : "example.com/org/healthy@\(digest)"]
+        if outputArguments == ["--format", "json"] {
+          let rows = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(output.utf8)) as? [[String: Any]])
+          XCTAssertEqual(rows.compactMap { $0["Name"] as? String }, expectedNames)
+        } else if outputArguments == ["--quiet"] {
+          XCTAssertEqual(output.split(separator: "\n").map(String.init), expectedNames)
+        } else {
+          for name in expectedNames {
+            XCTAssertTrue(output.contains(name))
+          }
+          XCTAssertFalse(output.contains("disappearing"))
+        }
+      }
     }
   }
 
@@ -333,11 +601,12 @@ final class CommandBehaviorTests: XCTestCase {
     )
   }
 
-  private func installUnavailableDiskutil() throws -> String? {
+  private func installUnavailableDiskutil(beforeFailure: String = "") throws -> String? {
     let binDirectory = try temporaryDirectory()
     let diskutilURL = binDirectory.appendingPathComponent("diskutil")
     let script = """
     #!/bin/sh
+    \(beforeFailure)
     echo 'Resource temporarily unavailable' >&2
     exit 1
     """

@@ -37,8 +37,8 @@ struct Clone: AsyncParsableCommand {
   @Flag(help: "overwrite an existing local VM")
   var overwrite: Bool = false
 
-  @Option(help: ArgumentHelp("limit automatic pruning to n gigabytes", valueName: "n"))
-  var pruneLimit: UInt = 100
+  @Option(help: ArgumentHelp("limit post-clone pruning in GiB", valueName: "n"))
+  var pruneLimit = ProcessInfo.processInfo.environment["TART_CLONE_PRUNE_LIMIT"] ?? "100"
 
   func validate() throws {
     if newName.contains("/") {
@@ -50,7 +50,16 @@ struct Clone: AsyncParsableCommand {
     }
   }
 
+  func pruneLimitBytes() throws -> Int {
+    let bytesPerGiB = 1024 * 1024 * 1024
+    guard let limit = UInt(pruneLimit), limit <= UInt(Int.max / bytesPerGiB) else {
+      throw ValidationError("clone prune limit must be a whole number between 0 and \(Int.max / bytesPerGiB) GiB")
+    }
+    return Int(limit) * bytesPerGiB
+  }
+
   func run() async throws {
+    let limitBytes = try pruneLimitBytes()
     let ociStorage = try VMStorageOCI()
     let localStorage = try VMStorageLocal()
     let remoteName = try? RemoteName(sourceName)
@@ -106,6 +115,8 @@ struct Clone: AsyncParsableCommand {
       try rejectExistingDestination(localStorage)
 
       let sourceState = try sourceVM.state()
+      let sourceConfig = try VMConfig(fromURL: sourceVM.configURL)
+
       let generateMAC = try localStorage.hasVMsWithMACAddress(macAddress: sourceVM.macAddress())
         && sourceState != .Suspended
 
@@ -128,6 +139,10 @@ struct Clone: AsyncParsableCommand {
         try sourceVM.clone(to: tmpVMDir, generateMAC: generateMAC)
       }
 
+      if sourceState != .Suspended, sourceConfig.platform is Linux {
+        try tmpVMDir.regenerateLinuxMachineIdentifier()
+      }
+
       try localStorage.move(newName, from: tmpVMDir)
 
       try lock.unlock()
@@ -139,7 +154,7 @@ struct Clone: AsyncParsableCommand {
       if sourceVM.isStandalone {
         let unallocatedBytes = try sourceVM.sizeBytes() - sourceVM.allocatedSizeBytes()
         // Avoid reclaiming an excessive amount of disk space.
-        let reclaimBytes = min(unallocatedBytes, Int(pruneLimit) * 1024 * 1024 * 1024)
+        let reclaimBytes = min(unallocatedBytes, limitBytes)
         if reclaimBytes > 0 {
           try Prune.reclaimIfNeeded(UInt64(reclaimBytes), sourceVM)
         }
@@ -149,7 +164,7 @@ struct Clone: AsyncParsableCommand {
         // overlay may grow to the full guest-visible disk block layout at
         // runtime. Reclaim against the clone so it is not pruned itself.
         let unallocatedBytes = try clonedVM.diskSizeBytes() - clonedVM.allocatedSizeBytes()
-        let reclaimBytes = min(unallocatedBytes, Int(pruneLimit) * 1024 * 1024 * 1024)
+        let reclaimBytes = min(unallocatedBytes, limitBytes)
         if reclaimBytes > 0 {
           try Prune.reclaimIfNeeded(UInt64(reclaimBytes), clonedVM)
         }

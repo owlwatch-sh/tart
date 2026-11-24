@@ -23,11 +23,6 @@ struct VMDirectory: Prunable {
   var stateURL: URL {
     baseURL.appendingPathComponent("state.vzvmsave")
   }
-  // machineIdentifierURL is a Linux VM's machine identifier (Linux.machineIdentifier),
-  // which a saved state is restored only under.
-  var machineIdentifierURL: URL {
-    baseURL.appendingPathComponent(Linux.machineIdentifierFile)
-  }
   var manifestURL: URL {
     baseURL.appendingPathComponent("manifest.json")
   }
@@ -186,7 +181,6 @@ struct VMDirectory: Prunable {
     try? FileManager.default.removeItem(at: manifestURL)
     try? FileManager.default.removeItem(at: overlayURL)
     try? FileManager.default.removeItem(at: stateURL)
-    try? FileManager.default.removeItem(at: machineIdentifierURL)
   }
 
   func validate(userFriendlyName: String) throws {
@@ -222,20 +216,7 @@ struct VMDirectory: Prunable {
     try FileManager.default.copyItem(at: configURL, to: to.configURL)
     try FileManager.default.copyItem(at: nvramURL, to: to.nvramURL)
     try FileManager.default.copyItem(at: diskURL, to: to.diskURL)
-    // A Linux VM's saved state is restored only under the machine identifier it
-    // was saved with: a clone that takes the one takes the other, or neither.
-    // Without a state, a clone makes an identifier of its own at its first run. A
-    // macOS VM keeps its identifier in its config.
-    if (try? FileManager.default.copyItem(at: stateURL, to: to.stateURL)) != nil {
-      do {
-        if try VMConfig(fromURL: to.configURL).os == .linux {
-          try FileManager.default.copyItem(at: machineIdentifierURL, to: to.machineIdentifierURL)
-        }
-      } catch {
-        try? FileManager.default.removeItem(at: to.stateURL)
-        throw error
-      }
-    }
+    try? FileManager.default.copyItem(at: stateURL, to: to.stateURL)
 
     // Re-generate MAC address
     if generateMAC {
@@ -247,34 +228,29 @@ struct VMDirectory: Prunable {
     try VMConfig(fromURL: configURL).macAddress.string
   }
 
-  // removeMachineIdentifierWithoutState drops a Linux VM's machine identifier
-  // unless a saved state needs it to be restored. An import keeps the archive's
-  // identifier only for that, as a clone keeps its source's: otherwise two
-  // imports of one archive would share one, so the VM makes its own at first run.
-  // Only an identifier that is already gone is not an error: one that stays
-  // would be shared with the VM it came from.
-  func removeMachineIdentifierWithoutState() throws {
-    if FileManager.default.fileExists(atPath: stateURL.path) {
-      return
-    }
-    do {
-      try FileManager.default.removeItem(at: machineIdentifierURL)
-    } catch CocoaError.fileNoSuchFile, CocoaError.fileReadNoSuchFile {
-    }
-  }
-
   func regenerateMACAddress() throws {
     var vmConfig = try VMConfig(fromURL: configURL)
 
     vmConfig.macAddress = VZMACAddress.randomLocallyAdministered()
-    try vmConfig.save(toURL: configURL)
-
-    // cleanup state if any, and the Linux machine identifier kept only to
-    // restore it: a clone, an import or a run that collided is no longer the
-    // VM that was saved. Only once the new MAC is kept, so that a failed save
-    // leaves the VM as it was.
+    // cleanup state if any
     try? FileManager.default.removeItem(at: stateURL)
-    try removeMachineIdentifierWithoutState()
+
+    try vmConfig.save(toURL: configURL)
+  }
+
+  func regenerateLinuxMachineIdentifier() throws {
+    var vmConfig = try VMConfig(fromURL: configURL)
+    guard var vmLinux = vmConfig.platform as? Linux else {
+      throw RuntimeError.VMConfigurationError("cannot regenerate a Linux machine identifier on a non-Linux VM")
+    }
+
+    vmLinux.machineIdentifier = VZGenericMachineIdentifier()
+    vmConfig.platform = vmLinux
+
+    // cleanup state if any
+    try? FileManager.default.removeItem(at: stateURL)
+
+    try vmConfig.save(toURL: configURL)
   }
 
   func resizeDisk(
@@ -392,16 +368,16 @@ struct VMDirectory: Prunable {
 
     do {
       try process.run()
-      process.waitUntilExit()
-
-      let data = pipe.fileHandleForReading.readDataToEndOfFile()
-
-      if process.terminationStatus != 0 {
-        let output = String(data: data, encoding: .utf8) ?? "Unknown error"
-        throw RuntimeError.FailedToResizeDisk("Failed to resize ASIF disk image: \(output)")
-      }
     } catch {
       throw RuntimeError.FailedToResizeDisk("Failed to execute diskutil resize: \(error)")
+    }
+    process.waitUntilExit()
+
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+
+    if process.terminationStatus != 0 {
+      let output = String(data: data, encoding: .utf8) ?? "Unknown error"
+      throw RuntimeError.FailedToResizeDisk("Failed to resize ASIF disk image: \(output)")
     }
   }
 
