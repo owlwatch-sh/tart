@@ -19,21 +19,16 @@ permissions:
   contents: read
 
 jobs:
-  release:
+  # The build has no way to the signing credentials: no OIDC token, no
+  # environment. What it builds, a package's build plugin included, cannot
+  # reach Doppler; the signing job below takes only the app it assembles.
+  build:
     if: github.repository == 'owlwatch-sh/tart'
-    name: Release
+    name: Build
     runs-on: macos-26
     timeout-minutes: 90
-    # Only a tag's run signs, in the release environment: its tag rule
-    # (*-owlwatch.*) and reviewer are the gate, and its subject is the one
-    # Doppler's release identity trusts. A push to badgery builds unsigned.
-    environment: ${{ startsWith(github.ref, 'refs/tags/') && 'release' || '' }}
-    permissions:
-      contents: write
-      id-token: write
     env:
       VERSION: ${{ github.ref_name }}
-      RELEASE: ${{ startsWith(github.ref, 'refs/tags/') }}
     steps:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
@@ -58,9 +53,60 @@ jobs:
           restore-keys: |
             tart-arm64-${{ steps.xcode.outputs.version }}-${{ hashFiles('Package.resolved') }}-
             tart-arm64-${{ steps.xcode.outputs.version }}-
+      - name: Build
+        run: |
+          # Report upstream's version: the guest agent in macOS guests reads it from a
+          # console port name and exits when it doesn't accept it, as with 2.40.1-badgery.2
+          VERSION="${VERSION%%-owlwatch.*}" .ci/set-version.sh
+          sh .ci/build-release.sh arm64
+      - name: Assemble the app
+        run: |
+          APP_PATH="dist/tart.app"
+          mkdir -p "$APP_PATH/Contents/MacOS" "$APP_PATH/Contents/Resources"
+          cp .build/prebuilt/arm64/tart "$APP_PATH/Contents/MacOS/tart"
+          cp Resources/Info.plist "$APP_PATH/Contents/"
+          cp "Resources/actool/UPW Tart.icns" "Resources/actool/Assets.car" "$APP_PATH/Contents/Resources/"
+          cp LICENSE dist/
+          "$APP_PATH/Contents/MacOS/tart" --version
+      - name: Hand the app to the signing job
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: tart-unsigned
+          path: dist
+          retention-days: 1
+          if-no-files-found: error
+
+  # Only a tag's run signs, in the release environment: its tag rule
+  # (*-owlwatch.*) and reviewer are the gate, and its subject is the one
+  # Doppler's release identity trusts. It runs nothing it did not write here:
+  # the checkout is for the entitlements alone.
+  release:
+    if: github.repository == 'owlwatch-sh/tart' && startsWith(github.ref, 'refs/tags/')
+    needs: build
+    name: Release
+    runs-on: macos-26
+    timeout-minutes: 90
+    environment: release
+    permissions:
+      contents: write
+      id-token: write
+    env:
+      VERSION: ${{ github.ref_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - name: Take the app
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: tart-unsigned
+          path: dist
+      - name: Make it executable
+        run: chmod 755 dist/tart.app/Contents/MacOS/tart
       - name: Read Apple signing credentials from Doppler
         id: doppler
-        if: env.RELEASE == 'true'
         env:
           DOPPLER_IDENTITY: ${{ vars.DOPPLER_IDENTITY }}
           SECRETS: MACOS_SIGN_P12 MACOS_SIGN_PASSWORD MACOS_NOTARY_KEY MACOS_NOTARY_KEY_ID MACOS_NOTARY_ISSUER_ID
@@ -94,7 +140,6 @@ jobs:
             printf '%s<<%s\n%s\n%s\n' "$name" "$delimiter" "$value" "$delimiter" >> "$GITHUB_OUTPUT"
           done
       - name: Import signing certificate
-        if: env.RELEASE == 'true'
         env:
           MACOS_SIGN_P12: ${{ steps.doppler.outputs.MACOS_SIGN_P12 }}
           MACOS_SIGN_PASSWORD: ${{ steps.doppler.outputs.MACOS_SIGN_PASSWORD }}
@@ -117,24 +162,12 @@ jobs:
             "$RUNNER_TEMP/build.keychain"
           security list-keychain -d user -s "$RUNNER_TEMP/build.keychain" $(security list-keychains -d user | tr -d '"')
           rm "$RUNNER_TEMP/certificate.p12"
-      - name: Build
-        run: |
-          # Report upstream's version: the guest agent in macOS guests reads it from a
-          # console port name and exits when it doesn't accept it, as with 2.40.1-badgery.2
-          VERSION="${VERSION%%-owlwatch.*}" .ci/set-version.sh
-          sh .ci/build-release.sh arm64
-      - name: Assemble, sign and notarize
-        if: env.RELEASE == 'true'
+      - name: Sign and notarize
         env:
           MACOS_NOTARY_KEY_ID: ${{ steps.doppler.outputs.MACOS_NOTARY_KEY_ID }}
           MACOS_NOTARY_ISSUER_ID: ${{ steps.doppler.outputs.MACOS_NOTARY_ISSUER_ID }}
         run: |
           APP_PATH="dist/tart.app"
-          mkdir -p "$APP_PATH/Contents/MacOS" "$APP_PATH/Contents/Resources"
-          cp .build/prebuilt/arm64/tart "$APP_PATH/Contents/MacOS/tart"
-          cp Resources/Info.plist "$APP_PATH/Contents/"
-          cp "Resources/actool/UPW Tart.icns" "Resources/actool/Assets.car" "$APP_PATH/Contents/Resources/"
-
           IDENTITY=$(security find-identity -v -p codesigning "$RUNNER_TEMP/build.keychain" \
             | sed -n 's/.*\([0-9A-F]\{40\}\) "Developer ID Application: .*/\1/p' | head -n 1)
           codesign \
@@ -147,7 +180,6 @@ jobs:
             --entitlements Resources/tart-badgery.entitlements \
             "$APP_PATH"
           codesign --verify --strict --verbose=2 "$APP_PATH"
-          "$APP_PATH/Contents/MacOS/tart" --version
 
           ditto -c -k --keepParent "$APP_PATH" "$RUNNER_TEMP/tart-notarization.zip"
           xcrun notarytool submit "$RUNNER_TEMP/tart-notarization.zip" \
@@ -160,12 +192,10 @@ jobs:
           xcrun stapler validate "$APP_PATH"
           spctl --assess --type execute --verbose=4 "$APP_PATH"
 
-          cp LICENSE dist/
           tar -C dist -czf tart.tar.gz tart.app LICENSE
           shasum -a 256 tart.tar.gz "$APP_PATH/Contents/MacOS/tart" | tee SHA256SUMS
           codesign --display --requirements - "$APP_PATH" 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Publish
-        if: env.RELEASE == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -174,7 +204,7 @@ jobs:
             --title "$VERSION" \
             --notes "Owlwatch build of Tart $VERSION: arm64, signed by Owlwatch (Bright Shore Technologies), adds \`tart run --vsock-socket\` and \`--net-softnet-control-socket\`. Without com.apple.vm.networking, so --net-bridged is unavailable."
       - name: Remove signing material
-        if: always() && env.RELEASE == 'true'
+        if: always()
         run: |
           security delete-keychain "$RUNNER_TEMP/build.keychain" || true
           rm -f "$RUNNER_TEMP/notary.p8" "$RUNNER_TEMP/certificate.p12"
