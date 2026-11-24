@@ -24,8 +24,13 @@ jobs:
     name: Release
     runs-on: macos-26
     timeout-minutes: 90
+    # Only a tag's run signs, in the release environment: its tag rule
+    # (*-owlwatch.*) and reviewer are the gate, and its subject is the one
+    # Doppler's release identity trusts. A push to badgery builds unsigned.
+    environment: ${{ startsWith(github.ref, 'refs/tags/') && 'release' || '' }}
     permissions:
       contents: write
+      id-token: write
     env:
       VERSION: ${{ github.ref_name }}
       RELEASE: ${{ startsWith(github.ref, 'refs/tags/') }}
@@ -53,12 +58,47 @@ jobs:
           restore-keys: |
             tart-arm64-${{ steps.xcode.outputs.version }}-${{ hashFiles('Package.resolved') }}-
             tart-arm64-${{ steps.xcode.outputs.version }}-
+      - name: Read Apple signing credentials from Doppler
+        id: doppler
+        if: env.RELEASE == 'true'
+        env:
+          DOPPLER_IDENTITY: ${{ vars.DOPPLER_IDENTITY }}
+          SECRETS: MACOS_SIGN_P12 MACOS_SIGN_PASSWORD MACOS_NOTARY_KEY MACOS_NOTARY_KEY_ID MACOS_NOTARY_ISSUER_ID
+        run: |
+          # Signs in to Doppler by OIDC, as owlwatch-sh/owlwatch's release jobs do
+          # (its docs/doppler.md): this job's ID token, issued in the release
+          # environment, for a short-lived token that reads the release config.
+          # Every value is masked before anything is written; nothing is printed.
+          set -euo pipefail
+          if ! [[ "$DOPPLER_IDENTITY" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+            echo "::error::set DOPPLER_IDENTITY in this repository's release environment"
+            exit 1
+          fi
+          id=$(curl -fsS -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=doppler" | jq -r '.value // empty')
+          [ -n "$id" ] || { echo "::error::no GitHub OIDC token for this job"; exit 1; }
+          echo "::add-mask::$id"
+          token=$(jq -n --arg identity "$DOPPLER_IDENTITY" --arg token "$id" '{identity: $identity, token: $token}' |
+            curl -fsS -X POST -H 'Content-Type: application/json' --data @- https://api.doppler.com/v3/auth/oidc | jq -r '.token // empty')
+          [ -n "$token" ] || { echo "::error::Doppler refused this job's sign-in"; exit 1; }
+          echo "::add-mask::$token"
+          values="$RUNNER_TEMP/doppler.json"
+          trap 'rm -f "$values"' EXIT
+          curl -fsS -G -H "Authorization: Bearer $token" -H 'Accept: application/json' \
+            --data-urlencode project=owlwatch --data-urlencode config=release --data-urlencode format=json \
+            --data-urlencode "secrets=${SECRETS// /,}" https://api.doppler.com/v3/configs/config/secrets/download > "$values"
+          jq -r '.[] | strings | split("\n")[] | select(length > 0) | "::add-mask::" + .' "$values"
+          for name in $SECRETS; do
+            value=$(jq -r --arg name "$name" '.[$name] // empty' "$values")
+            [ -n "$value" ] || { echo "::error::Doppler owlwatch/release has no value for $name"; exit 1; }
+            delimiter="doppler_$(openssl rand -hex 16)"
+            printf '%s<<%s\n%s\n%s\n' "$name" "$delimiter" "$value" "$delimiter" >> "$GITHUB_OUTPUT"
+          done
       - name: Import signing certificate
         if: env.RELEASE == 'true'
         env:
-          MACOS_SIGN_P12: ${{ secrets.MACOS_SIGN_P12 }}
-          MACOS_SIGN_PASSWORD: ${{ secrets.MACOS_SIGN_PASSWORD }}
-          MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
+          MACOS_SIGN_P12: ${{ steps.doppler.outputs.MACOS_SIGN_P12 }}
+          MACOS_SIGN_PASSWORD: ${{ steps.doppler.outputs.MACOS_SIGN_PASSWORD }}
+          MACOS_NOTARY_KEY: ${{ steps.doppler.outputs.MACOS_NOTARY_KEY }}
         run: |
           KEYCHAIN_PASSWORD=$(openssl rand -hex 32)
           echo "$MACOS_SIGN_P12" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
@@ -86,8 +126,8 @@ jobs:
       - name: Assemble, sign and notarize
         if: env.RELEASE == 'true'
         env:
-          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
-          MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+          MACOS_NOTARY_KEY_ID: ${{ steps.doppler.outputs.MACOS_NOTARY_KEY_ID }}
+          MACOS_NOTARY_ISSUER_ID: ${{ steps.doppler.outputs.MACOS_NOTARY_ISSUER_ID }}
         run: |
           APP_PATH="dist/tart.app"
           mkdir -p "$APP_PATH/Contents/MacOS" "$APP_PATH/Contents/Resources"
