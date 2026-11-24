@@ -187,6 +187,17 @@ struct Run: AsyncParsableCommand {
   """, valueName: "interface name"))
   var netBridged: [String] = []
 
+  @Option(help: ArgumentHelp("Use a connected datagram Unix domain socket inherited from the parent process for networking (e.g. --net-fd=3)",
+                             discussion: """
+                             The socket carries raw Ethernet frames, one per datagram.
+
+                             The simplest use-case is composing Tart and Softnet invocations that are orchestrated by another program, such as Orchard.
+
+                             Another way to use this argument is to connect a VM to any other networking implementation such as gVisor or software-defined networking implementation.
+                             """,
+                             valueName: "file descriptor"))
+  var netFd: Int32?
+
   @Flag(help: ArgumentHelp("Use software networking provided by Softnet instead of the default shared (NAT) networking",
                            discussion: """
                            Softnet provides better network isolation and alleviates DHCP shortage on production systems. Tart invokes Softnet when this option is specified as a sub-process and communicates with it over socketpair(2).
@@ -288,7 +299,9 @@ struct Run: AsyncParsableCommand {
   var rootDiskOpts: String = ""
 
   #if arch(arm64)
-    @Flag(help: ArgumentHelp("Disables audio and entropy devices; a macOS VM gets only Mac-specific input devices, and a Linux VM no keyboard or pointer.", discussion: "Useful for running a VM that can be suspended via \"tart suspend\"."))
+    @Flag(
+      help: ArgumentHelp("Disables or replaces devices that do not support VM suspension, such as audio, entropy and some input devices.",
+                         discussion: "Useful for running a VM that can be suspended via \"tart suspend\"."))
   #endif
   var suspendable: Bool = false
 
@@ -365,9 +378,10 @@ struct Run: AsyncParsableCommand {
     if netBridged.count > 0 { netFlags += 1 }
     if netSoftnet { netFlags += 1 }
     if netHost { netFlags += 1 }
+    if netFd != nil { netFlags += 1 }
 
     if netFlags > 1 {
-      throw ValidationError("--net-bridged, --net-softnet and --net-host are mutually exclusive")
+      throw ValidationError("--net-bridged, --net-softnet, --net-host and --net-fd are mutually exclusive")
     }
 
     if graphics && noGraphics {
@@ -375,7 +389,7 @@ struct Run: AsyncParsableCommand {
     }
 
     if (noGraphics || vnc || vncExperimental) && captureSystemKeys {
-      throw ValidationError("--captures-system-keys can only be used with the default VM view")
+      throw ValidationError("--capture-system-keys can only be used with the default VM view")
     }
 
     if nested {
@@ -392,25 +406,14 @@ struct Run: AsyncParsableCommand {
       suspendable = true
     }
 
-    // A Linux VM is suspendable too: Virtualization.framework saves its state as
-    // it does a macOS VM's (validateSaveRestoreSupport is asked at the suspend),
-    // given the machine identifier it was saved with (Linux.machineIdentifier).
-    // Asked first whether this host can save at all, as "tart suspend" will: a
-    // suspendable Linux VM has no keyboard or pointer, which is no trade on a
-    // host that cannot suspend it.
     if suspendable {
       let config = try VMConfig.init(fromURL: vmDir.configURL)
       if !(config.platform is PlatformSuspendable) {
-        throw ValidationError("You can only suspend macOS and Linux VMs")
+        throw ValidationError("This platform is not suspendable")
       }
-      if config.os == .linux {
-        #if arch(arm64)
-          if #unavailable(macOS 14) {
-            throw ValidationError("Suspending a Linux VM is supported on hosts starting with macOS 14 (Sonoma)")
-          }
-        #else
-          throw ValidationError("Suspending a Linux VM is supported on Apple silicon hosts only")
-        #endif
+
+      if let linux = config.platform as? Linux, linux.machineIdentifier == nil {
+        throw ValidationError("Linux VMs without a machine identifier cannot be suspended or resumed")
       }
       if noTrackpad {
         throw ValidationError("--no-trackpad cannot be used with --suspendable")
@@ -456,14 +459,15 @@ struct Run: AsyncParsableCommand {
     let localStorage = try VMStorageLocal()
     let vmDir = try localStorage.open(name)
 
+    let storageLock = try FileLock(lockURL: Config().tartHomeDir)
+    try storageLock.lock()
+
     // Validate disk format support
     let vmConfig = try VMConfig(fromURL: vmDir.configURL)
     if !vmConfig.diskFormat.isSupported {
       throw ValidationError("Disk format '\(vmConfig.diskFormat.rawValue)' is not supported on this system.")
     }
 
-    let storageLock = try FileLock(lockURL: Config().tartHomeDir)
-    try storageLock.lock()
     // check if there is a running VM with the same MAC address
     let hasRunningMACCollision = try localStorage.list().contains {
       // check if there is a running VM with the same MAC but different name
@@ -473,6 +477,23 @@ struct Run: AsyncParsableCommand {
       print("There is already a running VM with the same MAC address!")
       print("Resetting VM to assign a new MAC address...")
       try vmDir.regenerateMACAddress()
+    }
+
+    // check if there is a running VM with the same Linux machine identifier but different name
+    if let linuxMachineIdentifier = (vmConfig.platform as? Linux)?.machineIdentifier {
+      let hasRunningLinuxMachineIdentifierCollision = try localStorage.list().contains {
+        if try !$1.running() || $1.name == vmDir.name {
+          return false
+        }
+        let otherConfig = try VMConfig(fromURL: $1.configURL)
+        return (otherConfig.platform as? Linux)?.machineIdentifier == linuxMachineIdentifier
+      }
+
+      if hasRunningLinuxMachineIdentifierCollision {
+        print("There is already a running VM with the same Linux machine identifier!")
+        print("Resetting VM to assign a new Linux machine identifier...")
+        try vmDir.regenerateLinuxMachineIdentifier()
+      }
     }
 
     if netSoftnet && isInteractiveSession() {
@@ -510,17 +531,22 @@ struct Run: AsyncParsableCommand {
     let additionalDisks = try additionalDisks()
     defer { withExtendedLifetime(additionalDisks) {} }
 
+    // Same for the temporary directories that remote --dir archives are unarchived into.
+    var directoryShareLocks: [FileLock] = []
+    defer { withExtendedLifetime(directoryShareLocks) {} }
+
     vm = try VM(
       vmDir: vmDir,
       network: userSpecifiedNetwork(vmDir: vmDir) ?? NetworkShared(),
       additionalStorageDevices: additionalDisks.map(\.configuration),
-      directorySharingDevices: directoryShares() + rosettaDirectoryShare(),
+      directorySharingDevices: directoryShares(retaining: &directoryShareLocks) + rosettaDirectoryShare(),
       serialPorts: serialPorts,
       suspendable: suspendable,
       nested: nested,
       audio: !noAudio,
       clipboard: !noClipboard,
       noUSBAccessories: noUSBAccessories,
+      readOnly: diskOptions.readOnly,
       sync: VZDiskImageSynchronizationMode(diskOptions.syncModeRaw),
       caching: VZDiskImageCachingMode(diskOptions.cachingModeRaw),
       noTrackpad: noTrackpad,
@@ -776,13 +802,17 @@ struct Run: AsyncParsableCommand {
           interface.identifier == name || interface.localizedDisplayName == name
         }
         if (interface == nil) {
-          throw ValidationError("no bridge interfaces matched \"\(netBridged)\", "
+          throw ValidationError("no bridge interfaces matched \"\(name)\", "
             + "available interfaces: \(bridgeInterfaces())")
         }
         return interface!
       }
 
       return NetworkBridged(interfaces: try netBridged.map { try findBridgedInterface($0) })
+    }
+
+    if let netFd = netFd {
+      return try NetworkFD(fd: netFd)
     }
 
     return nil
@@ -806,7 +836,7 @@ struct Run: AsyncParsableCommand {
     }
   }
 
-  func directoryShares() throws -> [VZDirectorySharingDeviceConfiguration] {
+  func directoryShares(retaining locks: inout [FileLock]) throws -> [VZDirectorySharingDeviceConfiguration] {
     if dir.isEmpty {
       return []
     }
@@ -832,13 +862,13 @@ struct Run: AsyncParsableCommand {
       }
       if directoryShares.count == 1 && directoryShares.first!.name == nil {
         let directoryShare = directoryShares.first!
-        let singleDirectoryShare = VZSingleDirectoryShare(directory: try directoryShare.createConfiguration())
+        let singleDirectoryShare = VZSingleDirectoryShare(directory: try directoryShare.createConfiguration(retaining: &locks))
         sharingDevice.share = singleDirectoryShare
       } else if !allNamedShares {
         throw ValidationError("invalid --dir syntax: for multiple directory shares each one of them should be named")
       } else {
         var directories: [String : VZSharedDirectory] = Dictionary()
-        try directoryShares.forEach { directories[$0.name!] = try $0.createConfiguration() }
+        try directoryShares.forEach { directories[$0.name!] = try $0.createConfiguration(retaining: &locks) }
         sharingDevice.share = VZMultipleDirectoryShare(directories: directories)
       }
 
@@ -1032,6 +1062,10 @@ struct AdditionalDisk {
   init(parseFrom: String) throws {
     let (diskPath, readOnly, syncModeRaw, cachingModeRaw) = Self.parseOptions(parseFrom)
 
+    if diskPath.isEmpty {
+      throw ValidationError("--disk requires a path or URL, e.g. --disk=/path/to/disk.img")
+    }
+
     self = try Self.craft(
       diskPath,
       readOnly: readOnly,
@@ -1137,7 +1171,12 @@ struct AdditionalDisk {
       let lock = try FileLock(lockURL: clonedDiskURL)
       try lock.lock()
 
-      let diskImageAttachment = try VZDiskImageStorageDeviceAttachment(url: clonedDiskURL, readOnly: diskReadOnly)
+      let diskImageAttachment = try VZDiskImageStorageDeviceAttachment(
+        url: clonedDiskURL,
+        readOnly: diskReadOnly,
+        cachingMode: try VZDiskImageCachingMode(cachingModeRaw) ?? .automatic,
+        synchronizationMode: try VZDiskImageSynchronizationMode(syncModeRaw)
+      )
 
       return AdditionalDisk(configuration: VZVirtioBlockDeviceConfiguration(attachment: diskImageAttachment), temporaryDiskLock: lock)
     }
@@ -1161,7 +1200,7 @@ struct AdditionalDisk {
   static func parseOptions(_ parseFrom: String) -> (String, Bool, String, String) {
     var arguments = parseFrom.split(separator: ":")
 
-    let options = DiskOptions(String(arguments.last!))
+    let options = DiskOptions(String(arguments.last ?? ""))
     if options.foundAtLeastOneOption {
       arguments.removeLast()
     }
@@ -1284,6 +1323,10 @@ struct DirectoryShare {
     // Consume options
     (self.readOnly, self.mountTag, parseFrom) = Self.parseOptions(parseFrom)
 
+    if parseFrom.split(separator: ":").isEmpty {
+      throw ValidationError("--dir requires a path, e.g. --dir=build:/Users/admin/build")
+    }
+
     // Special case for URLs
     if parseFrom.hasPrefix("http:") || parseFrom.hasPrefix("https:") {
       self.name = nil
@@ -1305,7 +1348,7 @@ struct DirectoryShare {
 
   static func parseOptions(_ parseFrom: String) -> (Bool, String, String) {
     var arguments = parseFrom.split(separator: ":")
-    let options = arguments.last!.split(separator: ",")
+    let options = arguments.last?.split(separator: ",") ?? []
 
     var readOnly: Bool = false
     var mountTag: String = VZVirtioFileSystemDeviceConfiguration.macOSGuestAutomountTag
@@ -1332,7 +1375,7 @@ struct DirectoryShare {
     return (readOnly, mountTag, arguments.joined(separator: ":"))
   }
 
-  func createConfiguration() throws -> VZSharedDirectory {
+  func createConfiguration(retaining locks: inout [FileLock]) throws -> VZSharedDirectory {
     if (path.isFileURL) {
       return VZSharedDirectory(url: path, readOnly: readOnly)
     }
@@ -1374,6 +1417,7 @@ struct DirectoryShare {
     try FileManager.default.createDirectory(atPath: temporaryLocation.path, withIntermediateDirectories: true)
     let lock = try FileLock(lockURL: temporaryLocation)
     try lock.lock()
+    locks.append(lock)
 
     guard let executableURL = resolveBinaryPath("tar") else {
       throw ValidationError("tar not found in PATH")
@@ -1404,7 +1448,7 @@ struct DirectoryShare {
 
 extension String {
   func toRemoteOrLocalURL() -> URL {
-    if (starts(with: "https://") || starts(with: "https://")) {
+    if (starts(with: "http://") || starts(with: "https://")) {
       URL(string: self)!
     } else {
       URL(fileURLWithPath: NSString(string: self).expandingTildeInPath)

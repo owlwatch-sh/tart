@@ -20,7 +20,7 @@ class DockerConfigCredentialsProvider: CredentialsProvider {
     return nil
   }
 
-  private func executeHelper(binaryName: String, host: String) throws -> (String, String)? {
+  func executeHelper(binaryName: String, host: String) throws -> (String, String)? {
     guard let executableURL = resolveBinaryPath(binaryName) else {
       throw CredentialsProviderError.Failed(message: "\(binaryName) not found in PATH")
     }
@@ -33,7 +33,6 @@ class DockerConfigCredentialsProvider: CredentialsProvider {
     let inPipe = Pipe()
 
     process.standardOutput = outPipe
-    process.standardError = outPipe
     process.standardInput = inPipe
 
     process.launch()
@@ -104,13 +103,13 @@ struct DockerAuthConfig: Codable {
     guard let data = Data(base64Encoded: authBase64) else {
       return nil
     }
-    guard let components = String(data: data, encoding: .utf8)?.components(separatedBy: ":") else {
+    guard let components = String(data: data, encoding: .utf8)?.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false) else {
       return nil
     }
     if components.count != 2 {
       return nil
     }
-    return (components[0], components[1])
+    return (String(components[0]), String(components[1]))
   }
 }
 

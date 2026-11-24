@@ -69,12 +69,15 @@ struct TokenResponse: Decodable, Authentication {
     let dateFormatter = ISO8601DateFormatter()
     dateFormatter.formatOptions = [.withInternetDateTime]
     dateFormatter.timeZone = TimeZone(secondsFromGMT: 0)
+    let fractionalDateFormatter = ISO8601DateFormatter()
+    fractionalDateFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    fractionalDateFormatter.timeZone = TimeZone(secondsFromGMT: 0)
 
     decoder.dateDecodingStrategy = .custom { decoder in
       let container = try decoder.singleValueContainer()
       let dateString = try container.decode(String.self)
 
-      return dateFormatter.date(from: dateString) ?? Date()
+      return dateFormatter.date(from: dateString) ?? fractionalDateFormatter.date(from: dateString) ?? Date()
     }
 
     var response = try decoder.decode(TokenResponse.self, from: fromData)
@@ -357,12 +360,9 @@ class Registry {
   ) async throws -> (AsyncThrowingStream<Data, Error>, HTTPURLResponse) {
     var urlComponents = urlComponents
 
-    if urlComponents.queryItems == nil && !parameters.isEmpty {
-      urlComponents.queryItems = []
-    }
-    urlComponents.queryItems?.append(contentsOf: parameters.map { key, value -> URLQueryItem in
+    Self.updateQueryItems(parameters.map { key, value in
       URLQueryItem(name: key, value: value)
-    })
+    }, in: &urlComponents)
 
     var request = URLRequest(url: urlComponents.url!)
     request.httpMethod = method.rawValue
@@ -382,6 +382,30 @@ class Registry {
     }
 
     return (channel, response)
+  }
+
+  // Preserve the exact encoding of existing query values, even when the
+  // caller supplies no additional parameters. URLComponents.queryItems decodes
+  // then re-encodes retained items, which changes values such as alpha%2Bbeta.
+  private static func updateQueryItems(
+    _ items: [URLQueryItem],
+    in components: inout URLComponents,
+    replacingExisting: Bool = false
+  ) {
+    guard !items.isEmpty else { return }
+
+    var additions = URLComponents()
+    additions.queryItems = items
+
+    var existing = components.percentEncodedQueryItems ?? []
+    if replacingExisting {
+      let replacementNames = items.map { $0.name }
+      existing.removeAll { item in
+        guard let name = item.name.removingPercentEncoding else { return false }
+        return replacementNames.contains(name)
+      }
+    }
+    components.percentEncodedQueryItems = existing + (additions.percentEncodedQueryItems ?? [])
   }
 
   private func auth(response: HTTPURLResponse) async throws {
@@ -420,13 +444,15 @@ class Registry {
     // >[...] using the service and scope values from the WWW-Authenticate header.
     //
     // [1]: https://docs.docker.com/registry/spec/auth/token/
-    authenticateURL.queryItems = ["scope", "service"].compactMap { key in
+    let challengeQueryItems: [URLQueryItem] = ["scope", "service"].compactMap { key in
       if let value = wwwAuthenticate.kvs[key] {
         return URLQueryItem(name: key, value: value)
       } else {
         return nil
       }
     }
+
+    Self.updateQueryItems(challengeQueryItems, in: &authenticateURL, replacingExisting: true)
 
     var headers: Dictionary<String, String> = Dictionary()
 

@@ -30,6 +30,9 @@ enum CodingKeys: String, CodingKey {
   // macOS-specific keys
   case ecid
   case hardwareModel
+
+  // Linux-specific keys
+  case machineIdentifier
 }
 
 struct VMDisplayConfig: Codable, Equatable {
@@ -130,7 +133,7 @@ struct VMConfig: Codable {
     let encodedMacAddress = try container.decode(String.self, forKey: .macAddress)
     guard let macAddress = VZMACAddress.init(string: encodedMacAddress) else {
       throw DecodingError.dataCorruptedError(
-        forKey: .hardwareModel,
+        forKey: .macAddress,
         in: container,
         debugDescription: "failed to initialize VZMacAddress using the provided value")
     }
