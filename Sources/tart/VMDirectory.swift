@@ -232,10 +232,11 @@ struct VMDirectory: Prunable {
     var vmConfig = try VMConfig(fromURL: configURL)
 
     vmConfig.macAddress = VZMACAddress.randomLocallyAdministered()
-    // cleanup state if any
-    try? FileManager.default.removeItem(at: stateURL)
-
     try vmConfig.save(toURL: configURL)
+
+    // cleanup state if any, only once the new MAC is kept, so that a failed
+    // save leaves the VM as it was
+    try? FileManager.default.removeItem(at: stateURL)
   }
 
   func regenerateLinuxMachineIdentifier() throws {
@@ -246,11 +247,10 @@ struct VMDirectory: Prunable {
 
     vmLinux.machineIdentifier = VZGenericMachineIdentifier()
     vmConfig.platform = vmLinux
-
-    // cleanup state if any
-    try? FileManager.default.removeItem(at: stateURL)
-
     try vmConfig.save(toURL: configURL)
+
+    // cleanup state if any, only once the new identifier is kept, as above
+    try? FileManager.default.removeItem(at: stateURL)
   }
 
   func resizeDisk(

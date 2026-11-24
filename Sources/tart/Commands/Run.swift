@@ -406,12 +406,6 @@ struct Run: AsyncParsableCommand {
       suspendable = true
     }
 
-    // A Linux VM is suspendable too: Virtualization.framework saves its state as
-    // it does a macOS VM's (validateSaveRestoreSupport is asked at the suspend),
-    // given the machine identifier it was saved with (Linux.machineIdentifier).
-    // Asked first whether this host can save at all, as "tart suspend" will: a
-    // suspendable Linux VM has no keyboard or pointer, which is no trade on a
-    // host that cannot suspend it.
     if suspendable {
       let config = try VMConfig.init(fromURL: vmDir.configURL)
       if !(config.platform is PlatformSuspendable) {
