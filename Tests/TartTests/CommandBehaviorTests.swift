@@ -99,6 +99,47 @@ final class CommandBehaviorTests: XCTestCase {
     }
   }
 
+  func testVsockSocketPortsParseAndValidate() throws {
+    try withTemporaryTartHome {
+      let vmDir = try VMStorageLocal().create("vsock")
+      try config().save(toURL: vmDir.configURL)
+      XCTAssertTrue(FileManager.default.createFile(atPath: vmDir.nvramURL.path, contents: Data()))
+      XCTAssertTrue(FileManager.default.createFile(atPath: vmDir.diskURL.path, contents: Data()))
+
+      let command = try Run.parseAsRoot([
+        "vsock", "--net-softnet-block=10.0.0.0/8", "--vsock-socket", "10789", "--vsock-socket=10790",
+      ]) as! Run
+      XCTAssertEqual(command.vsockSocket, [10789, 10790])
+      XCTAssertTrue(command.netSoftnet)
+      XCTAssertEqual(vmDir.vsockSocketURL(port: 10789).lastPathComponent, "vsock-10789.sock")
+      XCTAssertEqual(vmDir.vsockSocketURL(port: 10789).deletingLastPathComponent().standardizedFileURL,
+                     vmDir.baseURL.standardizedFileURL)
+
+      for invalid in [["0"], ["8080"], ["10789", "10789"]] {
+        XCTAssertThrowsError(try Run.parseAsRoot(["vsock"] + invalid.flatMap { ["--vsock-socket", $0] }),
+                             "\(invalid) should be refused")
+      }
+    }
+  }
+
+  func testSoftnetControlSocketImpliesSoftnetAndExcludesControlFD() throws {
+    try withTemporaryTartHome {
+      let vmDir = try VMStorageLocal().create("softnet-control")
+      try config().save(toURL: vmDir.configURL)
+      XCTAssertTrue(FileManager.default.createFile(atPath: vmDir.nvramURL.path, contents: Data()))
+      XCTAssertTrue(FileManager.default.createFile(atPath: vmDir.diskURL.path, contents: Data()))
+
+      let command = try Run.parseAsRoot(["softnet-control", "--net-softnet-control-socket"]) as! Run
+      XCTAssertTrue(command.netSoftnetControlSocket)
+      XCTAssertTrue(command.netSoftnet)
+      XCTAssertEqual(vmDir.softnetControlSocketURL.lastPathComponent, "softnet.sock")
+
+      XCTAssertThrowsError(try Run.parseAsRoot([
+        "softnet-control", "--net-softnet-control-socket", "--net-softnet-control-fd=3",
+      ]))
+    }
+  }
+
   func testStandaloneDeleteDoesNotInitializeContentStore() throws {
     try withTemporaryTartHome {
       let vmDir = try VMStorageLocal().create("standalone")

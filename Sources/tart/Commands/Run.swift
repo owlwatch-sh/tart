@@ -234,6 +234,13 @@ struct Run: AsyncParsableCommand {
   """, valueName: "file descriptor"))
   var netSoftnetControlFd: Int32?
 
+  @Flag(help: ArgumentHelp("Serve the Softnet control channel on softnet.sock in the VM's directory", discussion: """
+  Each connection to softnet.sock may send Softnet control requests, one per line, and receives one response line per request. Connections are served one at a time. This can be used to dynamically replace Softnet allow and block lists while the VM is running, like --net-softnet-control-fd, without having to hold a file descriptor for the life of the VM.
+
+  The socket is created with mode 0600, so only the user running "tart run" and root can connect. Implies --net-softnet.
+  """))
+  var netSoftnetControlSocket: Bool = false
+
   @Option(help: ArgumentHelp("Comma-separated list of TCP ports to expose (e.g. --net-softnet-expose 2222:22,8080:80)", discussion: """
   Options are comma-separated and are as follows:
 
@@ -252,6 +259,13 @@ struct Run: AsyncParsableCommand {
 
   @Flag(help: ArgumentHelp("Restrict network access to the host-only network"))
   var netHost: Bool = false
+
+  @Option(help: ArgumentHelp("Expose a guest vsock port as a Unix socket in the VM's directory (e.g. --vsock-socket 10789)", discussion: """
+  Each connection to vsock-<port>.sock in the VM's directory is forwarded to that port in the guest over virtio-vsock, the way the control socket reaches the Tart Guest Agent. The guest sees the connection come from the host (CID 2).
+
+  The socket is created with mode 0600, so only the user running "tart run" and root can connect. May be repeated for several ports. Requires macOS 14 or newer.
+  """, valueName: "port"))
+  var vsockSocket: [UInt32] = []
 
   @Option(help: ArgumentHelp("Set the root disk options (e.g. --root-disk-opts=\"ro\" or --root-disk-opts=\"caching=cached,sync=none\")",
                              discussion: """
@@ -274,7 +288,7 @@ struct Run: AsyncParsableCommand {
   var rootDiskOpts: String = ""
 
   #if arch(arm64)
-    @Flag(help: ArgumentHelp("Disables audio and entropy devices and switches to only Mac-specific input devices.", discussion: "Useful for running a VM that can be suspended via \"tart suspend\"."))
+    @Flag(help: ArgumentHelp("Disables audio and entropy devices; a macOS VM gets only Mac-specific input devices, and a Linux VM no keyboard or pointer.", discussion: "Useful for running a VM that can be suspended via \"tart suspend\"."))
   #endif
   var suspendable: Bool = false
 
@@ -322,9 +336,28 @@ struct Run: AsyncParsableCommand {
       throw ValidationError("--vnc and --vnc-experimental are mutually exclusive")
     }
 
+    for port in vsockSocket {
+      if port == 0 || port == UInt32.max {
+        throw ValidationError("--vsock-socket: \(port) is not a usable vsock port")
+      }
+      if port == 8080 {
+        throw ValidationError("--vsock-socket: port 8080 is the Tart Guest Agent's, already served by the control socket")
+      }
+    }
+    if Swift.Set(vsockSocket).count != vsockSocket.count {
+      throw ValidationError("--vsock-socket: each port may be given only once")
+    }
+    if !vsockSocket.isEmpty, #unavailable(macOS 14) {
+      throw ValidationError("--vsock-socket requires macOS 14 or newer")
+    }
+
     // Automatically enable --net-softnet when any of its related options are specified
-    if netSoftnetAllow != nil || netSoftnetBlock != nil || netSoftnetExpose != nil || netSoftnetControlFd != nil {
+    if netSoftnetAllow != nil || netSoftnetBlock != nil || netSoftnetExpose != nil || netSoftnetControlFd != nil || netSoftnetControlSocket {
       netSoftnet = true
+    }
+
+    if netSoftnetControlSocket && netSoftnetControlFd != nil {
+      throw ValidationError("--net-softnet-control-socket and --net-softnet-control-fd are mutually exclusive")
     }
 
     // Check that no more than one network option is specified
@@ -359,12 +392,26 @@ struct Run: AsyncParsableCommand {
       suspendable = true
     }
 
+    // A Linux VM is suspendable too: Virtualization.framework saves its state as
+    // it does a macOS VM's (validateSaveRestoreSupport is asked at the suspend),
+    // given the machine identifier it was saved with (Linux.machineIdentifier).
+    // Asked first whether this host can save at all, as "tart suspend" will: a
+    // suspendable Linux VM has no keyboard or pointer, which is no trade on a
+    // host that cannot suspend it.
     if suspendable {
       let config = try VMConfig.init(fromURL: vmDir.configURL)
       if !(config.platform is PlatformSuspendable) {
-        throw ValidationError("You can only suspend macOS VMs")
+        throw ValidationError("You can only suspend macOS and Linux VMs")
       }
-
+      if config.os == .linux {
+        #if arch(arm64)
+          if #unavailable(macOS 14) {
+            throw ValidationError("Suspending a Linux VM is supported on hosts starting with macOS 14 (Sonoma)")
+          }
+        #else
+          throw ValidationError("Suspending a Linux VM is supported on Apple silicon hosts only")
+        #endif
+      }
       if noTrackpad {
         throw ValidationError("--no-trackpad cannot be used with --suspendable")
       }
@@ -579,6 +626,14 @@ struct Run: AsyncParsableCommand {
           ErrorReportingTask("Failed to run control socket") {
             try await controlSocket.run()
           }
+
+          for port in vsockSocket {
+            let vsockSocket = try await ControlSocket(vmDir.vsockSocketURL(port: port), vmPort: port, permissions: 0o600)
+
+            ErrorReportingTask("Failed to run vsock socket for port \(port)") {
+              try await vsockSocket.run()
+            }
+          }
         }
 
         try await vm!.run()
@@ -699,7 +754,12 @@ struct Run: AsyncParsableCommand {
     if netSoftnet {
       let config = try VMConfig.init(fromURL: vmDir.configURL)
 
-      return try Softnet(vmMACAddress: config.macAddress.string, extraArguments: softnetExtraArguments, controlFD: netSoftnetControlFd)
+      var controlFD = netSoftnetControlFd
+      if netSoftnetControlSocket {
+        controlFD = try SoftnetControlSocket.start(vmDir.softnetControlSocketURL)
+      }
+
+      return try Softnet(vmMACAddress: config.macAddress.string, extraArguments: softnetExtraArguments, controlFD: controlFD)
     }
 
     if netHost {
